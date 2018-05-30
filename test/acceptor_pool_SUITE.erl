@@ -27,6 +27,7 @@
          start_error/1,
          child_error/1,
          transient_shutdown/1,
+         shutdown_accept/1,
          shutdown_children/1,
          kill_children/1,
          grace_children/1,
@@ -42,6 +43,7 @@ all() ->
      {group, transient},
      {group, temporary},
      {group, shutdown_timeout},
+     {group, infinity_shutdown_timeout},
      {group, brutal_kill},
      {group, code_change}].
 
@@ -52,6 +54,8 @@ groups() ->
      {temporary, [start_error]},
      {shutdown_timeout, [parallel],
       [shutdown_children, kill_children, grace_children]},
+     {infinity_shutdown_timeout, [parallel],
+      [shutdown_accept]},
      {brutal_kill, [parallel],
       [shutdown_children, kill_children, grace_children]},
      {code_change, [parallel], [change_spec, change_ignore, change_error]}].
@@ -72,6 +76,8 @@ init_per_group(transient, Config) ->
     [{restart, transient} | init_per_group(all, Config)];
 init_per_group(brutal_kill, Config) ->
     [{shutdown, brutal_kill} | init_per_group(all, Config)];
+init_per_group(infinity_shutdown_timeout, Config) ->
+    [{init, {ok, trap_exit}}, {grace, 500}, {shutdown, infinity} | init_per_group(all, Config)];
 init_per_group(_, Config) ->
     [{restart, temporary} || undefined == ?config(restart, Config)] ++
     [{shutdown, 500} || undefined == ?config(shutdown, Config)] ++
@@ -284,6 +290,16 @@ transient_shutdown(Config) ->
 
     ok.
 
+shutdown_accept(Config) ->
+    Pool = ?config(pool, Config),
+
+    _ = process_flag(trap_exit, true),
+    exit(Pool, shutdown),
+
+    receive {'EXIT', Pool, _} -> ok end,
+
+    ok.
+
 shutdown_children(Config) ->
     Connect = ?config(connect, Config),
 
@@ -299,7 +315,7 @@ shutdown_children(Config) ->
     [{_, Pid1, _, _}, {_, Pid2, _, _}] = acceptor_pool:which_children(Pool),
 
     {links, Links} = process_info(Pool, links),
-    [Acceptor] = Links -- [Pid1, Pid2, self()],
+    [Acceptor, _LSock] = Links -- [Pid1, Pid2, self()],
 
     Ref1 = monitor(process, Pid1),
     Ref2 = monitor(process, Pid2),
@@ -315,9 +331,9 @@ shutdown_children(Config) ->
 
     receive {'DOWN', Ref1, _, _, Reason} -> ok end,
     receive {'DOWN', Ref2, _, _, Reason} -> ok end,
-    receive {'DOWN', ARef, _, _, Reason} -> ok end,
+    receive {'DOWN', ARef, _, _, {shutdown, closed}} -> ok end,
 
-    receive {'EXIT', Pool, shutdown} -> ok end,
+    receive {'EXIT', Pool, _} -> ok end,
 
     ok.
 
@@ -336,7 +352,7 @@ kill_children(Config) ->
     [{_, Pid1, _, _}, {_, Pid2, _, _}] = acceptor_pool:which_children(Pool),
 
     {links, Links} = process_info(Pool, links),
-    [Acceptor] = Links -- [Pid1, Pid2, self()],
+    [Acceptor, _LSock] = Links -- [Pid1, Pid2, self()],
 
     Ref1 = monitor(process, Pid1),
     Ref2 = monitor(process, Pid2),
@@ -345,11 +361,7 @@ kill_children(Config) ->
     _ = process_flag(trap_exit, true),
     exit(Pool, shutdown),
 
-    Shutdown = ?config(shutdown, Config),
-    receive
-        {'DOWN', ARef, _, _, shutdown} when Shutdown /= brutal_kill -> ok;
-        {'DOWN', ARef, _, _, killed} when Shutdown == brutal_kill -> ok
-    end,
+    receive {'DOWN', ARef, _, _, {shutdown, closed}} -> ok end,
     receive {'DOWN', Ref1, _, _, killed} -> ok end,
     receive {'DOWN', Ref2, _, _, killed} -> ok end,
 
@@ -372,7 +384,7 @@ grace_children(Config) ->
     [{_, Pid1, _, _}, {_, Pid2, _, _}] = acceptor_pool:which_children(Pool),
 
     {links, Links} = process_info(Pool, links),
-    [Acceptor] = Links -- [Pid1, Pid2, self()],
+    [Acceptor, _LSock] = Links -- [Pid1, Pid2, self()],
 
     Ref1 = monitor(process, Pid1),
     Ref2 = monitor(process, Pid2),
@@ -387,9 +399,7 @@ grace_children(Config) ->
     ok = gen_tcp:send(ClientB, "hello"),
     {ok, "hello"} = gen_tcp:recv(ClientB, 0, ?TIMEOUT),
 
-    {ok, ClientC} = Connect(),
-    ok = gen_tcp:send(ClientC, "hello"),
-    {ok, "hello"} = gen_tcp:recv(ClientC, 0, ?TIMEOUT),
+    ?assertEqual({error, econnrefused} = Connect()),
 
     Reason = case ?config(shutdown, Config) of
                  brutal_kill -> killed;
@@ -398,7 +408,7 @@ grace_children(Config) ->
 
     receive {'DOWN', Ref1, _, _, Reason} -> ok end,
     receive {'DOWN', Ref2, _, _, Reason} -> ok end,
-    receive {'DOWN', ARef, _, _, Reason} -> ok end,
+    receive {'DOWN', ARef, _, _, {shutdown, closed}} -> ok end,
 
     receive {'EXIT', Pool, shutdown} -> ok end,
 

@@ -116,7 +116,8 @@
                                    {module(), name(), gen_tcp:socket()}},
                 acceptors = #{} :: #{pid() =>
                                      {reference(), name(), reference()}},
-                conns = #{} :: #{pid() => {name(), name(), reference()}}}).
+                conns = #{} :: #{pid() => {name(), name(), reference()}},
+                listen_socket :: gen_tcp:socket()}).
 
 -callback init(Args) -> {ok, {PoolFlags, [AcceptorSpec, ...]}} | ignore when
       Args :: any(),
@@ -167,6 +168,7 @@ start_link(Name, Module, Args) ->
       Reason :: inet:posix().
 accept_socket(Pool, Sock, Acceptors)
   when is_port(Sock), is_integer(Acceptors), Acceptors > 0 ->
+    ok = gen_tcp:controlling_process(Sock, Pool),
     gen_server:call(Pool, {accept_socket, Sock, Acceptors}, infinity).
 
 %% @doc List the listen sockets being used by the `acceptor_pool'.
@@ -230,7 +232,7 @@ handle_call({accept_socket, Sock, NumAcceptors}, _, State) ->
     case socket_info(Sock) of
         {ok, SockInfo} ->
             NState = start_acceptors(SockRef, SockInfo, NumAcceptors, State),
-            {reply, {ok, SockRef}, NState};
+            {reply, {ok, SockRef}, NState#state{listen_socket=Sock}};
         {error, _} = Error ->
             demonitor(SockRef, [flush]),
             {reply, Error, State}
@@ -305,9 +307,11 @@ format_status(_, [_, #state{mod=Mod} = State]) ->
 terminate(_, State) ->
     #state{conns=Conns, acceptors=Acceptors, grace=Grace, shutdown=Shutdown,
            restart=Restart, name=Name, id=Id, start={AMod, _, _},
-           type=Type} = State,
+           type=Type, listen_socket=LSock} = State,
+
     Pids = maps:keys(Acceptors) ++ maps:keys(Conns),
     MRefs = maps:from_list([{monitor(process, Pid), Pid} || Pid <- Pids]),
+    gen_tcp:close(LSock),
     Timer = grace_timer(Grace, Shutdown),
     Reports = await_down(Timer, Restart, MRefs),
     terminate_report(Name, Id, AMod, Restart, Shutdown, Type, Reports).
@@ -382,7 +386,7 @@ validate_spec(shutdown, Shutdown) when is_integer(Shutdown), Shutdown >= 0 ->
 validate_spec(shutdown, Shutdown)
   when Shutdown == infinity; Shutdown == brutal_kill ->
     ok;
-validate_spec(grace, Grace) when is_integer(Grace), Grace >= 0 ->
+validate_spec(grace, Grace) when is_integer(Grace), Grace >= 0 ; Grace =:= infinity ->
     ok;
 validate_spec(type, Type) when Type == worker; Type == supervisor ->
     ok;
